@@ -1,72 +1,112 @@
-#include <esp_wifi.h>
-#include <esp_event.h>
-#include <nvs_flash.h>
+#include <stdio.h>
+#include <esp_types.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <driver/periph_ctrl.h>
+#include <driver/timer.h>
 #include "macros.h"
 
 
-static esp_err_t nvs_init() {
-  esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ERET( nvs_flash_erase() );
-    ERET( nvs_flash_init() );
-  }
-  ERET( ret );
-  return ESP_OK;
+#define TIMER_DIVIDER         16
+#define TIMER_SCALE           (TIMER_BASE_CLK / TIMER_DIVIDER)
+#define TIMER_INTERVAL0_SEC   (3.4179)
+#define TIMER_INTERVAL1_SEC   (5.78)
+#define TEST_WITHOUT_RELOAD   0
+#define TEST_WITH_RELOAD      1
+
+
+typedef struct {
+  int type;
+  int group;
+  int id;
+  uint64_t count;
+} timer_event_t;
+
+
+xQueueHandle timer_queue;
+
+
+static void inline print_timer_counter(uint64_t counter_value) {
+  printf("Counter: 0x%08x%08x\n", (uint32_t) (counter_value >> 32),
+                                  (uint32_t) (counter_value));
+  printf("Time   : %.8f s\n", (double) counter_value / TIMER_SCALE);
 }
 
 
-static void on_wifi(void* arg, esp_event_base_t base, int32_t id, void* data) {
-  if (id == WIFI_EVENT_AP_STACONNECTED) {
-    wifi_event_ap_staconnected_t *d = (wifi_event_ap_staconnected_t*) data;
-    printf("Station " MACSTR " joined, AID = %d (event)\n", MAC2STR(d->mac), d->aid);
-  } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
-    wifi_event_ap_stadisconnected_t *d = (wifi_event_ap_stadisconnected_t*) data;
-    printf("Station " MACSTR " left, AID = %d (event)\n", MAC2STR(d->mac), d->aid);
-  } else if(id == WIFI_EVENT_SCAN_DONE) {
-    printf("- WiFi scan done (event)\n");
-    printf("- Get scanned AP records\n");
-    static uint16_t count = 32;
-    static wifi_ap_record_t records[32];
-    ERETV( esp_wifi_scan_get_ap_records(&count, records) );
-    for(int i=0; i<count; i++) {
-      printf("%d. %s : %d\n", i+1, records[i].ssid, records[i].rssi);
+void IRAM_ATTR on_timer(void *arg) {
+  int id = (int) arg;
+  uint32_t status = TIMERG0.int_st_timers.val;
+  TIMERG0.hw_timer[id].update = 1;
+  uint64_t count =  ((uint64_t) TIMERG0.hw_timer[id].cnt_high) << 32 | TIMERG0.hw_timer[id].cnt_low;
+
+  timer_event_t e = {
+    .group = 0,
+    .id = id,
+    .count = count,
+  };
+
+  if ((status & BIT(id)) && id == TIMER_0) {
+    e.type = TEST_WITHOUT_RELOAD;
+    TIMERG0.int_clr_timers.t0 = 1;
+    count += (uint64_t) (TIMER_INTERVAL0_SEC * TIMER_SCALE);
+    TIMERG0.hw_timer[id].alarm_high = (uint32_t) (count >> 32);
+    TIMERG0.hw_timer[id].alarm_low = (uint32_t) count;
+  } else if ((status & BIT(id)) && id == TIMER_1) {
+    e.type = TEST_WITH_RELOAD;
+    TIMERG0.int_clr_timers.t1 = 1;
+  } else {
+    e.type = -1;
+  }
+
+  TIMERG0.hw_timer[id].config.alarm_en = TIMER_ALARM_EN;
+  xQueueSendFromISR(timer_queue, &e, NULL);
+}
+
+
+static void timer_begin(int id, bool auto_reload, double interval) {
+  timer_config_t c = {
+    .divider = TIMER_DIVIDER,
+    .counter_dir = TIMER_COUNT_UP,
+    .counter_en = TIMER_PAUSE,
+    .alarm_en = TIMER_ALARM_EN,
+    .intr_type = TIMER_INTR_LEVEL,
+    .auto_reload = auto_reload,
+  };
+  timer_init(TIMER_GROUP_0, id, &c);
+  timer_set_counter_value(TIMER_GROUP_0, id, 0x00000000ULL);
+  timer_set_alarm_value(TIMER_GROUP_0, id, interval * TIMER_SCALE);
+  timer_enable_intr(TIMER_GROUP_0, id);
+  timer_isr_register(TIMER_GROUP_0, id, on_timer, (void*) id, ESP_INTR_FLAG_IRAM, NULL);
+  timer_start(TIMER_GROUP_0, id);
+}
+
+
+static void task_timer_evt(void *arg) {
+  while (true) {
+    timer_event_t e;
+    xQueueReceive(timer_queue, &e, portMAX_DELAY);
+    if (e.type == TEST_WITHOUT_RELOAD) {
+      printf("\n    Example timer without reload\n");
+    } else if (e.type == TEST_WITH_RELOAD) {
+      printf("\n    Example timer with auto reload\n");
+    } else {
+      printf("\n    UNKNOWN EVENT TYPE\n");
     }
+    printf("Group[%d], timer[%d] alarm event\n", e.group, e.id);
+    printf("------- EVENT TIME --------\n");
+    print_timer_counter(e.count);
+    printf("-------- TASK TIME --------\n");
+    uint64_t task_counter_value;
+    timer_get_counter_value(e.group, e.id, &task_counter_value);
+    print_timer_counter(task_counter_value);
   }
-}
-
-
-static esp_err_t wifi_ap() {
-  printf("- Initialize TCP/IP adapter\n");
-  tcpip_adapter_init();
-  printf("- Create default event loop\n");
-  ERET( esp_event_loop_create_default() );
-  printf("- Initialize WiFi with default config\n");
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ERET( esp_wifi_init(&cfg) );
-  printf("- Register WiFi event handler\n");
-  ERET( esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, NULL) );
-  printf("- Set WiFi mode as AP\n");
-  ERET( esp_wifi_set_mode(WIFI_MODE_AP) );
-  printf("- Set WiFi configuration\n");
-  wifi_config_t wifi_config = {.ap = {
-    .ssid = "charmender",
-    .password = "charmender",
-    .ssid_len = 0,
-    .channel = 0,
-    .authmode = WIFI_AUTH_WPA_PSK,
-    .ssid_hidden = 0,
-    .max_connection = 4,
-    .beacon_interval = 100,
-  }};
-  ERET( esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config) );
-  printf("- Start WiFi\n");
-  ERET( esp_wifi_start() );
-  return ESP_OK;
 }
 
 
 void app_main() {
-  printf("- Initialize NVS\n");
-  ESP_ERROR_CHECK( nvs_init() );
-  ESP_ERROR_CHECK( wifi_ap() );
+  timer_queue = xQueueCreate(10, sizeof(timer_event_t));
+  timer_begin(TIMER_0, TEST_WITHOUT_RELOAD, TIMER_INTERVAL0_SEC);
+  timer_begin(TIMER_1, TEST_WITH_RELOAD,    TIMER_INTERVAL1_SEC);
+  xTaskCreate(task_timer_evt, "timer_evt", 2048, NULL, 5, NULL);
 }
